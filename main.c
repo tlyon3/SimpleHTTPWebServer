@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <string.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <errno.h>
 
 #include "create_server_socket.h"
 
@@ -12,7 +15,21 @@
 void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
 void handle_request(unsigned char *request, size_t request_len, unsigned char *response, int sock);
 
+void handle_sigchld(int sig) {
+    int saved_errno = errno;
+    while (waitpid((pid_t)(-1), 0, WNOHANG) > 0) {}
+    errno = saved_errno;
+}
+
 int main(int argc, char *argv[]) {
+    struct sigaction sa;
+    sa.sa_handler = &handle_sigchld;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, 0) == -1) {
+        perror(0);
+        exit(1);
+    }
 
     printf("Starting up server...\n");
 
@@ -33,7 +50,6 @@ int main(int argc, char *argv[]) {
             if(fork() == 0) {
                 serve_client(client, client_addr, client_addr_len);
             }
-            //todo: reap child on return
             continue;
         }
         return 0;
@@ -56,7 +72,7 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
         if(bytes_read == 0){
             printf("Disconnected from %s:%s\n", client_hostname, client_port);
             close(sock);
-            return;
+            exit(1);
         }
         else if(bytes_read < 0) {
             //error in recv

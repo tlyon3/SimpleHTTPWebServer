@@ -13,6 +13,8 @@
 
 int isOnMac;
 #define BUFFER_MAX 1024
+#define DEFAULT_PORT "8080"
+#define DEFAULT_CONFIG "http.conf"
 
 void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
 
@@ -25,7 +27,7 @@ int isGet(char *);
 int isHead(char *);
 
 int verbose = 1;
-char* dir = "./resources/www";
+char *dir = "../resources/www";
 
 char debugSting[BUFFER_MAX];
 
@@ -58,14 +60,49 @@ void verbosePrintf(char *s) {
     }
 }
 
+void usage(char* name) {
+    printf("Usage: %s [-v] [-p port] [-c config-file]\n", name);
+    printf("Example:\n");
+    printf("\t%s -v -p 8080 -c http.conf \n", name);
+    return;
+}
+
 int main(int argc, char *argv[]) {
+    char *port = NULL;
+    char *config_path = NULL;
+    port = DEFAULT_PORT;
+    config_path = DEFAULT_CONFIG;
+    int c;
+    while ((c = getopt(argc, argv, "vp:c:")) != -1) {
+        switch (c) {
+            case 'v':
+                verbose = 1;
+                break;
+            case 'p':
+                port = optarg;
+                break;
+            case 'c':
+                config_path = optarg;
+                break;
+            case '?':
+                if (optopt == 'p' || optopt == 'c') {
+                    fprintf(stderr, "Option -%c requires an argument\n", optopt);
+                    usage(argv[0]);
+                    exit(EXIT_FAILURE);
+                }
+            default:
+                fprintf(stderr, "Unknown option encountered\n");
+                usage(argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
     //different behavior based on operating system
     struct utsname unameData;
     uname(&unameData);
-    printf("uname: %s\n", unameData.sysname);
-    if(strcmp(unameData.sysname, "Darwin") == 0){
-      printf("Is running on macOS\n");
-      isOnMac = 1;
+    printf("OS: %s\n", unameData.sysname);
+    if (strcmp(unameData.sysname, "Darwin") == 0) {
+        printf("Is running on macOS\n");
+        isOnMac = 1;
     }
     struct sigaction sa;
     sa.sa_handler = &handle_sigchld;
@@ -78,12 +115,8 @@ int main(int argc, char *argv[]) {
 
     printf("Starting up server...\n");
 
-    //todo: Read port in from command line
-    int port = 8080;
-    char sport[10];
-    sprintf(sport, "%d", port);
-
-    int sock = create_server_socket(sport, SOCK_STREAM);
+    printf("Running on port: %s\n", port);
+    int sock = create_server_socket(port, SOCK_STREAM);
     printf("Created socket: %d\n", sock);
     while (1) {
         struct sockaddr_storage client_addr;
@@ -168,7 +201,7 @@ void handle_request(char *request, size_t request_len, int sock) {
             if ((fp = fopen(location, "r")) == NULL) {
                 printf("Error opening file\n");
             }
-            if((sb.st_mode & S_IRUSR) <= 0){
+            if ((sb.st_mode & S_IRUSR) <= 0) {
                 //incorrect permissions
                 //send back 403
                 char header[BUFFER_MAX];
@@ -241,17 +274,17 @@ void handle_request(char *request, size_t request_len, int sock) {
             send(sock, header, strlen(header), NULL);
 
             //macOS. Works!
-            if(isOnMac){
-              if(sendfile(fileno(fp), sock, 0, &size, NULL, 0) == -1){
-                  printf("Error sending file: %s\n", strerror(errno));
-              }
-            }else {
-              //linux. Works!
-              if(sendfile(sock, fileno(fp), 0, &size, NULL, 0) == -1){
-                  printf("Error sending file: %s\n", strerror(errno));
-              }
+            if (isOnMac) {
+                if (sendfile(fileno(fp), sock, 0, &size, NULL, 0) == -1) {
+                    printf("Error sending file: %s\n", strerror(errno));
+                }
+            } else {
+                //linux. Works!
+                if (sendfile(sock, fileno(fp), 0, &size, NULL, 0) == -1) {
+                    printf("Error sending file: %s\n", strerror(errno));
+                }
             }
-          close(fileno(fp));
+            close(fileno(fp));
             return;
         } else {
             char currentTime[80];

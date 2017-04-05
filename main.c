@@ -8,8 +8,10 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include "create_server_socket.h"
 
+int isOnMac;
 #define BUFFER_MAX 1024
 
 void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
@@ -23,7 +25,10 @@ int isGet(char *);
 int isHead(char *);
 
 int verbose = 1;
+char* dir = "./resources/www";
+
 char debugSting[BUFFER_MAX];
+
 char *notFound404 = "<html>\n<head>\n<title>404 Page Not Found</title>\n<body>\n\n<H2>404: Page not found</H2>\n\n</body></html>";
 char *notFound400 = "<html>\n<head>\n<title>400 Bad Request</title>\n<body>\n\n<H2>400: Received Bad Request</H2>\n\n</body></html>";
 char *notFound501 = "<html>\n<head>\n<title>501 Not Implemented</title>\n<body>\n\n<H2>501: Method not implemented</H2>\n\n</body></html>";
@@ -54,6 +59,14 @@ void verbosePrintf(char *s) {
 }
 
 int main(int argc, char *argv[]) {
+    //different behavior based on operating system
+    struct utsname unameData;
+    uname(&unameData);
+    printf("uname: %s\n", unameData.sysname);
+    if(strcmp(unameData.sysname, "Darwin") == 0){
+      printf("Is running on macOS\n");
+      isOnMac = 1;
+    }
     struct sigaction sa;
     sa.sa_handler = &handle_sigchld;
     sigemptyset(&sa.sa_mask);
@@ -141,10 +154,11 @@ void handle_request(char *request, size_t request_len, int sock) {
         char location[1024];
         //check if path is '/'
         if (strcmp(path, "/") == 0) {
-            strcpy(location, "resources/www/index.html");
+            strcpy(location, "/index.html");
+            prepend(location, dir);
         } else {
             strcpy(location, path);
-            prepend(location, "resources/www");
+            prepend(location, dir);
         }
 
         if (stat(location, &sb) != -1) {
@@ -152,12 +166,11 @@ void handle_request(char *request, size_t request_len, int sock) {
             //Check file permissions
             FILE *fp;
             if ((fp = fopen(location, "r")) == NULL) {
-
+                printf("Error opening file\n");
             }
             if((sb.st_mode & S_IRUSR) <= 0){
                 //incorrect permissions
                 //send back 403
-                printf("FORBIDDEN\n");
                 char header[BUFFER_MAX];
                 sprintf(header, "HTTP/1.1 403 Forbidden\r\nContent-Length: %d\r\n\r\n", sizeof(notFound403));
                 send(sock, header, strlen(header), 0);
@@ -225,17 +238,20 @@ void handle_request(char *request, size_t request_len, int sock) {
             verbosePrintf(header);
 
             //send header
-            send(sock, header, strlen(header), 0);
+            send(sock, header, strlen(header), NULL);
 
             //macOS. Works!
-            if(sendfile(fileno(fp), sock, 0, &size, NULL, 0) != 0){
-                printf("Error sending file\n");
+            if(isOnMac){
+              if(sendfile(fileno(fp), sock, 0, &size, NULL, 0) == -1){
+                  printf("Error sending file: %s\n", strerror(errno));
+              }
+            }else {
+              //linux. Works!
+              if(sendfile(sock, fileno(fp), 0, &size, NULL, 0) == -1){
+                  printf("Error sending file: %s\n", strerror(errno));
+              }
             }
-            //linux. NOT WORKING
-//            if(sendfile(sock, fp) == -1){
-//                printf("Error sending\n");
-//            }
-
+          close(fileno(fp));
             return;
         } else {
             char currentTime[80];

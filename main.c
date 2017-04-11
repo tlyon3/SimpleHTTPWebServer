@@ -9,12 +9,17 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <semaphore.h>
+#include <pthread.h>
 #include "create_server_socket.h"
+#include "queue.h"
 
 int isOnMac;
 #define BUFFER_MAX 1024
 #define DEFAULT_PORT "8080"
 #define DEFAULT_CONFIG "http.conf"
+#define THREAD_COUNT_DEFAULT 8
+#define MAX_QUEUE_SIZE_DEFAULT 10
 
 void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
 
@@ -26,16 +31,27 @@ int isGet(char *);
 
 int isHead(char *);
 
+void consume();
+void checkOS();
+
 int verbose = 1;
-char *dir = "../resources/www";
-
+char *dir = "./www";
 char debugSting[BUFFER_MAX];
-
 char *notFound404 = "<html>\n<head>\n<title>404 Page Not Found</title>\n<body>\n\n<H2>404: Page not found</H2>\n\n</body></html>";
-char *notFound400 = "<html>\n<head>\n<title>400 Bad Request</title>\n<body>\n\n<H2>400: Received Bad Request</H2>\n\n</body></html>";
-char *notFound501 = "<html>\n<head>\n<title>501 Not Implemented</title>\n<body>\n\n<H2>501: Method not implemented</H2>\n\n</body></html>";
-char *notFound403 = "<html>\n<head>\n<title>403 Forbidden</title>\n<body>\n\n<H2>403: File is forbidden</H2>\n\n</body></html>";
+char *badRequest400 = "<html>\n<head>\n<title>400 Bad Request</title>\n<body>\n\n<H2>400: Received Bad Request</H2>\n\n</body></html>";
+char *notImplemented500 = "<html>\n<head>\n<title>501 Not Implemented</title>\n<body>\n\n<H2>501: Method not implemented</H2>\n\n</body></html>";
+char *forbidden403 = "<html>\n<head>\n<title>403 Forbidden</title>\n<body>\n\n<H2>403: File is forbidden</H2>\n\n</body></html>";
+pthread_t *threadPool;
+pthread_mutex_t mutex;
+//todo: rename
+sem_t openQueueSpot;
+//todo: rename
+sem_t clientsInQueue;
+struct queue *queue1;
 
+typedef struct thread_param {
+    int id;
+} thread_param_t;
 
 void prepend(char *s, const char *t) {
     size_t len = strlen(t);
@@ -60,7 +76,7 @@ void verbosePrintf(char *s) {
     }
 }
 
-void usage(char* name) {
+void usage(char *name) {
     printf("Usage: %s [-v] [-p port] [-c config-file]\n", name);
     printf("Example:\n");
     printf("\t%s -v -p 8080 -c http.conf \n", name);
@@ -70,8 +86,12 @@ void usage(char* name) {
 int main(int argc, char *argv[]) {
     char *port = NULL;
     char *config_path = NULL;
+    int thread_count = THREAD_COUNT_DEFAULT;
+    int max_queue_size = MAX_QUEUE_SIZE_DEFAULT;
+
     port = DEFAULT_PORT;
     config_path = DEFAULT_CONFIG;
+
     int c;
     while ((c = getopt(argc, argv, "vp:c:")) != -1) {
         switch (c) {
@@ -83,6 +103,12 @@ int main(int argc, char *argv[]) {
                 break;
             case 'c':
                 config_path = optarg;
+                break;
+            case 't':
+                thread_count = atoi(optarg);
+                break;
+            case 'q':
+                max_queue_size = atoi(optarg);
                 break;
             case '?':
                 if (optopt == 'p' || optopt == 'c') {
@@ -96,41 +122,74 @@ int main(int argc, char *argv[]) {
                 exit(EXIT_FAILURE);
         }
     }
+
+    queue1 = newQueue(max_queue_size);
+
+    //create thread pool
+    pthread_mutex_init(&mutex, NULL);
+    sem_init(&openQueueSpot, 0, max_queue_size);
+    sem_init(&clientsInQueue, 0, 0);
+    threadPool = malloc(thread_count * sizeof(pthread_t));
+    for (int i = 0; i < thread_count; i++) {
+        thread_param_t *param = malloc(sizeof(thread_param_t));
+        param->id = i;
+        pthread_create(&threadPool[i], NULL, consume, param);
+    }
+    //todo: clean up thread pool when finished
+
     //different behavior based on operating system
-    struct utsname unameData;
-    uname(&unameData);
-    printf("OS: %s\n", unameData.sysname);
-    if (strcmp(unameData.sysname, "Darwin") == 0) {
-        printf("Is running on macOS\n");
-        isOnMac = 1;
-    }
-    struct sigaction sa;
-    sa.sa_handler = &handle_sigchld;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    if (sigaction(SIGCHLD, &sa, 0) == -1) {
-        perror(0);
-        exit(1);
-    }
+    checkOS();
+
+    //setup sighandler
+//    struct sigaction sa;
+//    sa.sa_handler = &handle_sigchld;
+//    sigemptyset(&sa.sa_mask);
+//    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+//    if (sigaction(SIGCHLD, &sa, 0) == -1) {
+//        perror(0);
+//        exit(1);
+//    }
 
     printf("Starting up server...\n");
-
     printf("Running on port: %s\n", port);
+
     int sock = create_server_socket(port, SOCK_STREAM);
     printf("Created socket: %d\n", sock);
+
+    //producer
     while (1) {
         struct sockaddr_storage client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
-        int client = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
-        if (client == -1) {
+        int clientFD = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
+        if (clientFD == -1) {
             printf("ERROR: error in accept\n");
         } else {
-            if (fork() == 0) {
-                serve_client(client, client_addr, client_addr_len);
-            }
+            //add client to queue
+            verbosePrintf("New client\n");
+            sem_wait(&openQueueSpot);
+            pthread_mutex_lock(&mutex);
+            enqueue(queue1, clientFD, client_addr, client_addr_len);
+            pthread_mutex_unlock(&mutex);
+            sem_post(&clientsInQueue);
             continue;
         }
+        verbosePrintf("Shutting down server\n");
         return 0;
+    }
+}
+
+//consumer
+void consume() {
+    printf("New client\n");
+    while (1) {
+        sem_wait(&clientsInQueue);
+        pthread_mutex_lock(&mutex);
+        struct node *client = dequeue(queue1);
+        pthread_mutex_unlock(&mutex);
+        sem_post(&openQueueSpot);
+        serve_client(client->clientFD, client->client_addr, client->addr_len);
+        free(client);
+        continue;
     }
 }
 
@@ -154,26 +213,37 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
         if (bytes_read == 0) {
             printf("Disconnected from %s:%s\n", client_hostname, client_port);
             close(sock);
-            exit(0);
+//            exit(0);
         } else if (bytes_read < 0) {
             //error in recv
             printf("ERROR: error in receiving\n");
             //todo: send back error code 500
         } else if (strstr(buffer, "\r\n\r\n")) {
             //todo: get first request
-            buffer[total_bytes_read] = '\0';
+//            buffer[total_bytes_read] = '\0';
             handle_request(buffer, bytes_read, sock);
             total_bytes_read = 0;
         } else {
             //todo: save what we have so far, wait for more
+            strcpy(newRequest, buffer);
         }
     }
 }
 
+void checkOS(){
+    struct utsname unameData;
+    uname(&unameData);
+    printf("OS: %s\n", unameData.sysname);
+    if (strcmp(unameData.sysname, "Darwin") == 0) {
+        printf("Is running on macOS\n");
+        isOnMac = 1;
+    }
+}
 //handle single request
 void handle_request(char *request, size_t request_len, int sock) {
     //parse request
-    printf("Received request: %s", request);
+    verbosePrintf("REQUEST: \n");
+    verbosePrintf(request);
 
     char *type;
     char *path;
@@ -204,11 +274,23 @@ void handle_request(char *request, size_t request_len, int sock) {
             if ((sb.st_mode & S_IRUSR) <= 0) {
                 //incorrect permissions
                 //send back 403
+                char currentTime[80];
+                struct tm *currentTimeInfo;
+                time_t rawTime;
+                currentTimeInfo = localtime(&rawTime);
+                strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
                 char header[BUFFER_MAX];
-                sprintf(header, "HTTP/1.1 403 Forbidden\r\nContent-Length: %d\r\n\r\n", sizeof(notFound403));
+                printf("FORBIDDEN\n");
+                sprintf(header,
+                        "HTTP/1.1 403 Forbidden\r\n"
+                                "Server: CS360 Server\r\n"
+                                "Date: %s\r\n"
+                                "Content-Type: text/html\r\n"
+                                "Content-Length: %d\r\n\r\n", currentTime, strlen(forbidden403));
                 send(sock, header, strlen(header), 0);
-                send(sock, notFound403, strlen(notFound403), 0);
+                send(sock, forbidden403, strlen(forbidden403), 0);
                 return;
+
             }
             //get MIME file type
             char contentType[16];
@@ -268,6 +350,7 @@ void handle_request(char *request, size_t request_len, int sock) {
                             "Last-Modified: %s\r\n\r\n",
                     currentTime, mimeType, size, lastMTime);
 
+            verbosePrintf("RESPONSE HEADER: \n");
             verbosePrintf(header);
 
             //send header
@@ -298,8 +381,9 @@ void handle_request(char *request, size_t request_len, int sock) {
             sprintf(header, "HTTP/1.1 404 Not Found\r\n"
                     "Date: %s\r\n"
                     "Content-Length: %d\r\n"
+                    "Content-Type: text/html\r\n"
                     "Server: CS360-Server\r\n\r\n", currentTime, strlen(notFound404));
-            printf("sent header: %s\n", header);
+            verbosePrintf(header);
             send(sock, header, strlen(header), 0);
             //send back html for 404
             send(sock, notFound404, strlen(notFound404), 0);
@@ -317,11 +401,12 @@ void handle_request(char *request, size_t request_len, int sock) {
         sprintf(header, "HTTP/1.1 501 Not Implemented\r\n"
                 "Date: %s\r\n"
                 "Content-Length: %d\r\n"
-                "Server: CS360-Server\r\n\r\n", currentTime, strlen(notFound501));
-        printf("sent header: %s\n", header);
+                "Content-Type: text/html\r\n"
+                "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
+        verbosePrintf(header);
         send(sock, header, strlen(header), 0);
         //send back html for 404
-        send(sock, notFound501, strlen(notFound501), 0);
+        send(sock, notImplemented500, strlen(notImplemented500), 0);
         return;
     } else if (isHead(type)) {
         char currentTime[80];
@@ -335,11 +420,12 @@ void handle_request(char *request, size_t request_len, int sock) {
         sprintf(header, "HTTP/1.1 501 Not Implemented\r\n"
                 "Date: %s\r\n"
                 "Content-Length: %d\r\n"
-                "Server: CS360-Server\r\n\r\n", currentTime, strlen(notFound501));
-        printf("sent header: %s\n", header);
+                "Content-Type: text/html\r\n"
+                "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
+        verbosePrintf(header);
         send(sock, header, strlen(header), 0);
         //send back html for 404
-        send(sock, notFound501, strlen(notFound501), 0);
+        send(sock, notImplemented500, strlen(notImplemented500), 0);
     } else {
         char currentTime[80];
         struct tm *currentTimeInfo;
@@ -349,12 +435,13 @@ void handle_request(char *request, size_t request_len, int sock) {
         char header[1024];
         sprintf(header, "HTTP/1.1 400 Bad Request\r\n"
                 "Date: %s\r\n"
+                "Content-Type: text/html\r\n"
                 "Content-Length: %d\r\n"
-                "Server: CS360-Server\r\n\r\n", currentTime, strlen(notFound400));
-        printf("sent header: %s\n", header);
+                "Server: CS360-Server\r\n\r\n", currentTime, strlen(badRequest400));
+        verbosePrintf(header);
         send(sock, header, strlen(header), 0);
         //send back html for 404
-        send(sock, notFound400, strlen(notFound400), 0);
+        send(sock, badRequest400, strlen(badRequest400), 0);
         close(sock);
         exit(400);
     }

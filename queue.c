@@ -3,8 +3,8 @@
 // C queue using a Linked-List implementation
 //
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <printf.h>
 #include "queue.h"
 
 struct queue newQueue(int size) {
@@ -57,10 +57,8 @@ struct node *dequeue(struct queue *queue) {
     if (queue->head) {
         struct node *head = queue->head;
         queue->head = queue->head->nextNode;
-        free(head);
         return head;
     } else {
-        printf("Queue is empty!\n");
         return NULL;
     }
 }
@@ -79,6 +77,5 @@ void deconstructQueue(struct queue *queue) {
             free(current);
         }
     }
-    free(queue);
 }
 

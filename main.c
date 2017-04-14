@@ -38,7 +38,7 @@ int isOnMac;
 int cont = 1;
 int verbose = 0;
 char *dir = "./www";
-char debugSting[BUFFER_MAX];
+//char debugSting[BUFFER_MAX];
 char *notFound404 = "<html>\n<head>\n<title>404 Page Not Found</title>\n<body>\n\n<H2>404: Page not found</H2>\n\n</body></html>";
 char *badRequest400 = "<html>\n<head>\n<title>400 Bad Request</title>\n<body>\n\n<H2>400: Received Bad Request</H2>\n\n</body></html>";
 char *notImplemented500 = "<html>\n<head>\n<title>501 Not Implemented</title>\n<body>\n\n<H2>501: Method not implemented</H2>\n\n</body></html>";
@@ -64,17 +64,20 @@ void prepend(char *s, const char *t) {
     }
 }
 
-void handle_sigchld(int sig) {
-    int saved_errno = errno;
-    while (waitpid((pid_t) (-1), 0, WNOHANG) > 0) {}
-    errno = saved_errno;
-}
+//void handle_sigchld(int sig) {
+//    int saved_errno = errno;
+//    while (waitpid((pid_t) (-1), 0, WNOHANG) > 0) {}
+//    errno = saved_errno;
+//}
 
 void clean_up_memory() {
     if (verbose) printf("Cleaning up memory\n");
     struct node *toFree = NULL;
     //free the queue
-    while (dequeue(&queue1) != NULL);
+    while ((toFree = dequeue(&queue1)) != NULL){
+        close(toFree->clientFD);
+    }
+    deconstructQueue(&queue1);
     if (verbose) printf("Freeing thread pool: count = %d\n",thread_count);
     for (int i = 0; i < thread_count; i++) {
         pthread_kill(threadPool[i], SIGINT);
@@ -87,6 +90,7 @@ void clean_up_memory() {
 }
 
 void sig_int(int sig) {
+    if(verbose) printf("Received signal: %d\n", sig);
     cont = 0;
 }
 
@@ -115,7 +119,6 @@ int main(int argc, char *argv[]) {
 
     int c;
     while ((c = getopt(argc, argv, "vp:c:t:q:")) != -1) {
-        printf("got opt: %c\n", c);
         switch (c) {
             case 'v':
                 verbose = 1;
@@ -163,7 +166,7 @@ int main(int argc, char *argv[]) {
     threadPool = malloc(thread_count * sizeof(pthread_t));
     //todo: keep track of thread_params to free them later
     for (int i = 0; i < thread_count; i++) {
-        pthread_create(&threadPool[i], NULL, consume, NULL);
+        pthread_create(&threadPool[i], NULL, (void *)consume, NULL);
     }
 
     //different behavior based on operating system
@@ -223,9 +226,13 @@ void consume() {
         } else {
             pthread_mutex_lock(&mutex);
             struct node *client = dequeue(&queue1);
+            int sock = client->clientFD;
+            struct sockaddr_storage caddr = client->client_addr;
+            socklen_t len = client->addr_len;
+            free(client);
             pthread_mutex_unlock(&mutex);
             sem_post(&openQueueSpot);
-            serve_client(client->clientFD, client->client_addr, client->addr_len);
+            serve_client(sock, caddr, len);
             continue;
         }
     }
@@ -248,7 +255,7 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
         bytes_read = recv(sock, buffer + total_bytes_read, BUFFER_MAX, 0);
         total_bytes_read += bytes_read;
         if (bytes_read == 0) {
-            printf("Disconnected from %s:%s\n", client_hostname, client_port);
+            if(verbose) printf("Disconnected from %s:%s\n", client_hostname, client_port);
             close(sock);
             return;
         } else if (bytes_read < 0) {
@@ -262,7 +269,7 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
                 if (verbose) printf("ERROR: error in receiving\n");
                 char currentTime[80];
                 struct tm *currentTimeInfo;
-                time_t rawTime;
+                time_t rawTime = 0;
                 currentTimeInfo = localtime(&rawTime);
                 strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
                 char header[BUFFER_MAX];
@@ -271,7 +278,7 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
                                 "Server: CS360 Server\r\n"
                                 "Date: %s\r\n"
                                 "Content-Type: text/html\r\n"
-                                "Content-Length: %d\r\n\r\n", currentTime, strlen(internalError500));
+                                "Content-Length: %lu\r\n\r\n", currentTime, strlen(internalError500));
                 send(sock, header, strlen(header), 0);
                 send(sock, internalError500, strlen(internalError500), 0);
                 total_bytes_read = 0;
@@ -285,8 +292,10 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
             memset(buffer, 0, BUFFER_MAX);
             continue;
         }
+        close(sock);
         return;
     }
+    close(sock);
 }
 
 void checkOS() {
@@ -337,7 +346,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                 //send back 403
                 char currentTime[80];
                 struct tm *currentTimeInfo;
-                time_t rawTime;
+                time_t rawTime = 0;
                 currentTimeInfo = localtime(&rawTime);
                 strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
                 char header[BUFFER_MAX];
@@ -347,14 +356,14 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                                 "Server: CS360 Server\r\n"
                                 "Date: %s\r\n"
                                 "Content-Type: text/html\r\n"
-                                "Content-Length: %d\r\n\r\n", currentTime, strlen(forbidden403));
+                                "Content-Length: %lu\r\n\r\n", currentTime, strlen(forbidden403));
                 send(sock, header, strlen(header), 0);
                 send(sock, forbidden403, strlen(forbidden403), 0);
                 return;
-
             }
+            //todo: there is a memory leak somewhere in here vv
             //get MIME file type
-            char contentType[16];
+            char contentType[16] = "n";
             int beginCopying = 0;
             int j = 0;
             for (int i = 1; i < strlen(location); i++) {
@@ -396,7 +405,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
             //get current time
             char currentTime[80];
             struct tm *currentTimeInfo;
-            time_t rawTime;
+            time_t rawTime = 0;
             currentTimeInfo = localtime(&rawTime);
             strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
 
@@ -407,7 +416,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                             "Date: %s\r\n"
                             "Server: CS360-Server\r\n"
                             "Content-Type: %s\r\n"
-                            "Content-Length: %d\r\n"
+                            "Content-Length: %lu\r\n"
                             "Last-Modified: %s\r\n\r\n",
                     currentTime, mimeType, size, lastMTime);
 
@@ -415,8 +424,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
             verbosePrintf(header);
 
             //send header
-            send(sock, header, strlen(header), NULL);
-
+            send(sock, header, strlen(header), 0);
             //macOS. Works!
             if (isOnMac) {
                 if (sendfile(fileno(fp), sock, 0, &size, NULL, 0) == -1) {
@@ -428,12 +436,16 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                     printf("Error sending file: %s\n", strerror(errno));
                 }
             }
-            close(fileno(fp));
+            if(verbose) printf("Closing file pointer\n");
+            if(fclose(fp) == -1){
+                printf("Error closing file: %s\n", strerror(errno));
+            }
+            //todo: there is a memory leak somewhere in here ^^
             return;
         } else {
             char currentTime[80];
             struct tm *currentTimeInfo;
-            time_t rawTime;
+            time_t rawTime = 0;
             currentTimeInfo = localtime(&rawTime);
             strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
             //file not found
@@ -441,7 +453,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
             char header[1024];
             sprintf(header, "HTTP/1.1 404 Not Found\r\n"
                     "Date: %s\r\n"
-                    "Content-Length: %d\r\n"
+                    "Content-Length: %lu\r\n"
                     "Content-Type: text/html\r\n"
                     "Server: CS360-Server\r\n\r\n", currentTime, strlen(notFound404));
             verbosePrintf(header);
@@ -453,7 +465,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
     } else if (isPost(type)) {
         char currentTime[80];
         struct tm *currentTimeInfo;
-        time_t rawTime;
+        time_t rawTime = 0;
         currentTimeInfo = localtime(&rawTime);
         strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
         //Not implemented
@@ -461,7 +473,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
         char header[1024];
         sprintf(header, "HTTP/1.1 501 Not Implemented\r\n"
                 "Date: %s\r\n"
-                "Content-Length: %d\r\n"
+                "Content-Length: %lu\r\n"
                 "Content-Type: text/html\r\n"
                 "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
         verbosePrintf(header);
@@ -472,7 +484,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
     } else if (isHead(type)) {
         char currentTime[80];
         struct tm *currentTimeInfo;
-        time_t rawTime;
+        time_t rawTime = 0;
         currentTimeInfo = localtime(&rawTime);
         strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
         //only need to send the header back
@@ -480,7 +492,7 @@ void handle_request(char *request, ssize_t request_len, int sock) {
         char header[1024];
         sprintf(header, "HTTP/1.1 501 Not Implemented\r\n"
                 "Date: %s\r\n"
-                "Content-Length: %d\r\n"
+                "Content-Length: %lu\r\n"
                 "Content-Type: text/html\r\n"
                 "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
         verbosePrintf(header);
@@ -490,14 +502,14 @@ void handle_request(char *request, ssize_t request_len, int sock) {
     } else {
         char currentTime[80];
         struct tm *currentTimeInfo;
-        time_t rawTime;
+        time_t rawTime = 0;
         currentTimeInfo = localtime(&rawTime);
         strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
         char header[1024];
         sprintf(header, "HTTP/1.1 400 Bad Request\r\n"
                 "Date: %s\r\n"
                 "Content-Type: text/html\r\n"
-                "Content-Length: %d\r\n"
+                "Content-Length: %lu\r\n"
                 "Server: CS360-Server\r\n\r\n", currentTime, strlen(badRequest400));
         verbosePrintf(header);
         send(sock, header, strlen(header), 0);

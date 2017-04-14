@@ -20,7 +20,7 @@ struct queue{
     struct node* head;
 };
 
-struct queue* newQueue(int);
+struct queue newQueue(int);
 int enqueue(struct queue*, int clientFD, struct sockaddr_storage, socklen_t);
 struct node* dequeue(struct queue* );
 

@@ -7,10 +7,10 @@
 #include <printf.h>
 #include "queue.h"
 
-struct queue* newQueue(int size) {
-    struct queue* queue = malloc(sizeof(struct queue));
-    queue->size = size;
-    queue->head = NULL;
+struct queue newQueue(int size) {
+    struct queue queue;
+    queue.size = size;
+    queue.head = NULL;
     return queue;
 
 }
@@ -19,7 +19,6 @@ struct queue* newQueue(int size) {
 // If the list is already full, no new node is added
 // Return Value: 1 if a node was added. 0 if not.
 int enqueue(struct queue *queue, int clientFD, struct sockaddr_storage storage, socklen_t socklen) {
-    printf("Adding %d to queue\n", clientFD);
     if (queue->head) {
         struct node *current = queue->head;
         //insert clientFD
@@ -58,7 +57,7 @@ struct node *dequeue(struct queue *queue) {
     if (queue->head) {
         struct node *head = queue->head;
         queue->head = queue->head->nextNode;
-        printf("Removed %d from queue\n", head->clientFD);
+        free(head);
         return head;
     } else {
         printf("Queue is empty!\n");

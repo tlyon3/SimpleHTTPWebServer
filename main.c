@@ -14,7 +14,6 @@
 #include "create_server_socket.h"
 #include "queue.h"
 
-int isOnMac;
 #define BUFFER_MAX 1024
 #define DEFAULT_PORT "8080"
 #define DEFAULT_CONFIG "http.conf"
@@ -23,7 +22,7 @@ int isOnMac;
 
 void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
 
-void handle_request(char *request, size_t request_len, int sock);
+void handle_request(char *request, ssize_t request_len, int sock);
 
 int isPost(char *);
 
@@ -32,26 +31,27 @@ int isGet(char *);
 int isHead(char *);
 
 void consume();
+
 void checkOS();
 
-int verbose = 1;
+int isOnMac;
+int cont = 1;
+int verbose = 0;
 char *dir = "./www";
 char debugSting[BUFFER_MAX];
 char *notFound404 = "<html>\n<head>\n<title>404 Page Not Found</title>\n<body>\n\n<H2>404: Page not found</H2>\n\n</body></html>";
 char *badRequest400 = "<html>\n<head>\n<title>400 Bad Request</title>\n<body>\n\n<H2>400: Received Bad Request</H2>\n\n</body></html>";
 char *notImplemented500 = "<html>\n<head>\n<title>501 Not Implemented</title>\n<body>\n\n<H2>501: Method not implemented</H2>\n\n</body></html>";
 char *forbidden403 = "<html>\n<head>\n<title>403 Forbidden</title>\n<body>\n\n<H2>403: File is forbidden</H2>\n\n</body></html>";
+char *internalError500 = "<html>\n<head>\n<title>500 Internal Server Error</title>\n<body>\n\n<H2>500: There was an error while serving the client</H2>\n\n</body></html>";
+
 pthread_t *threadPool;
 pthread_mutex_t mutex;
 //todo: rename
 sem_t openQueueSpot;
-//todo: rename
 sem_t clientsInQueue;
-struct queue *queue1;
-
-typedef struct thread_param {
-    int id;
-} thread_param_t;
+struct queue queue1;
+int thread_count = THREAD_COUNT_DEFAULT;
 
 void prepend(char *s, const char *t) {
     size_t len = strlen(t);
@@ -70,6 +70,26 @@ void handle_sigchld(int sig) {
     errno = saved_errno;
 }
 
+void clean_up_memory() {
+    if (verbose) printf("Cleaning up memory\n");
+    struct node *toFree = NULL;
+    //free the queue
+    while (dequeue(&queue1) != NULL);
+    if (verbose) printf("Freeing thread pool: count = %d\n",thread_count);
+    for (int i = 0; i < thread_count; i++) {
+        pthread_kill(threadPool[i], SIGINT);
+    }
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(threadPool[i], NULL);
+    }
+    free(threadPool);
+    exit(0);
+}
+
+void sig_int(int sig) {
+    cont = 0;
+}
+
 void verbosePrintf(char *s) {
     if (verbose) {
         printf("%s", s);
@@ -84,16 +104,18 @@ void usage(char *name) {
 }
 
 int main(int argc, char *argv[]) {
+
     char *port = NULL;
     char *config_path = NULL;
-    int thread_count = THREAD_COUNT_DEFAULT;
+    thread_count = THREAD_COUNT_DEFAULT;
     int max_queue_size = MAX_QUEUE_SIZE_DEFAULT;
 
     port = DEFAULT_PORT;
     config_path = DEFAULT_CONFIG;
 
     int c;
-    while ((c = getopt(argc, argv, "vp:c:")) != -1) {
+    while ((c = getopt(argc, argv, "vp:c:t:q:")) != -1) {
+        printf("got opt: %c\n", c);
         switch (c) {
             case 'v':
                 verbose = 1;
@@ -125,71 +147,87 @@ int main(int argc, char *argv[]) {
 
     queue1 = newQueue(max_queue_size);
 
+    //setup sighandler for safe clean up
+    struct sigaction sa;
+    sa.sa_handler = &sig_int;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, 0) == -1) {
+        perror(0);
+        exit(1);
+    }
+
     //create thread pool
     pthread_mutex_init(&mutex, NULL);
     sem_init(&openQueueSpot, 0, max_queue_size);
     sem_init(&clientsInQueue, 0, 0);
     threadPool = malloc(thread_count * sizeof(pthread_t));
+    //todo: keep track of thread_params to free them later
     for (int i = 0; i < thread_count; i++) {
-        thread_param_t *param = malloc(sizeof(thread_param_t));
-        param->id = i;
-        pthread_create(&threadPool[i], NULL, consume, param);
+        pthread_create(&threadPool[i], NULL, consume, NULL);
     }
-    //todo: clean up thread pool when finished
 
     //different behavior based on operating system
     checkOS();
-
-    //setup sighandler
-//    struct sigaction sa;
-//    sa.sa_handler = &handle_sigchld;
-//    sigemptyset(&sa.sa_mask);
-//    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-//    if (sigaction(SIGCHLD, &sa, 0) == -1) {
-//        perror(0);
-//        exit(1);
-//    }
 
     printf("Starting up server...\n");
     printf("Running on port: %s\n", port);
 
     int sock = create_server_socket(port, SOCK_STREAM);
-    printf("Created socket: %d\n", sock);
-
+    if(verbose) printf("Created socket: %d\n", sock);
+    cont = 1;
     //producer
-    while (1) {
+    while (cont) {
         struct sockaddr_storage client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
         int clientFD = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
         if (clientFD == -1) {
+            if(errno == EINTR){
+                if(cont == 0){
+                    if(verbose) printf("Exiting from producer\n");
+                    break;
+                }
+            }
             printf("ERROR: error in accept\n");
         } else {
             //add client to queue
             verbosePrintf("New client\n");
-            sem_wait(&openQueueSpot);
+            if(sem_wait(&openQueueSpot) == -1){
+                if(errno == EINTR){
+                    if(cont == 0){
+                        break;
+                    }
+                }
+            }
             pthread_mutex_lock(&mutex);
-            enqueue(queue1, clientFD, client_addr, client_addr_len);
+            enqueue(&queue1, clientFD, client_addr, client_addr_len);
             pthread_mutex_unlock(&mutex);
             sem_post(&clientsInQueue);
             continue;
         }
-        verbosePrintf("Shutting down server\n");
         return 0;
     }
+    verbosePrintf("Shutting down server\n");
+    clean_up_memory();
 }
 
 //consumer
 void consume() {
-    printf("New client\n");
-    while (1) {
-        sem_wait(&clientsInQueue);
-        pthread_mutex_lock(&mutex);
-        struct node *client = dequeue(queue1);
-        pthread_mutex_unlock(&mutex);
-        sem_post(&openQueueSpot);
-        serve_client(client->clientFD, client->client_addr, client->addr_len);
-        free(client);
-        continue;
+    while (cont) {
+        if (sem_wait(&clientsInQueue) == -1) {
+            if(errno == EINTR){
+                if(cont == 0){
+                    if(verbose) printf("Exiting from consume\n");
+                    break;
+                }
+            }
+        } else {
+            pthread_mutex_lock(&mutex);
+            struct node *client = dequeue(&queue1);
+            pthread_mutex_unlock(&mutex);
+            sem_post(&openQueueSpot);
+            serve_client(client->clientFD, client->client_addr, client->addr_len);
+            continue;
+        }
     }
 }
 
@@ -202,35 +240,56 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
     if (ret != 0) {
         printf("ERROR: error getting name info\n");
     }
-    printf("Connected to: %s:%s\n", client_hostname, client_port);
+   if(verbose) printf("Connected to: %s:%s\n", client_hostname, client_port);
     //serve client
-    size_t bytes_read = 0;
-    size_t total_bytes_read = 0;
-    char newRequest[BUFFER_MAX];
-    while (1) {
-        bytes_read = recv(sock, buffer, BUFFER_MAX, 0);
+    ssize_t bytes_read = 0;
+    ssize_t total_bytes_read = 0;
+    while (cont) {
+        bytes_read = recv(sock, buffer + total_bytes_read, BUFFER_MAX, 0);
         total_bytes_read += bytes_read;
         if (bytes_read == 0) {
             printf("Disconnected from %s:%s\n", client_hostname, client_port);
             close(sock);
-//            exit(0);
+            return;
         } else if (bytes_read < 0) {
             //error in recv
-            printf("ERROR: error in receiving\n");
-            //todo: send back error code 500
+            if (errno == EINTR) {
+                if (cont == 0) {
+                    if (verbose) printf("Exiting serve_client\n");
+                    break;
+                }
+            } else if (errno == EPIPE) {
+                if (verbose) printf("ERROR: error in receiving\n");
+                char currentTime[80];
+                struct tm *currentTimeInfo;
+                time_t rawTime;
+                currentTimeInfo = localtime(&rawTime);
+                strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
+                char header[BUFFER_MAX];
+                sprintf(header,
+                        "HTTP/1.1 500 Internal Server Error\r\n"
+                                "Server: CS360 Server\r\n"
+                                "Date: %s\r\n"
+                                "Content-Type: text/html\r\n"
+                                "Content-Length: %d\r\n\r\n", currentTime, strlen(internalError500));
+                send(sock, header, strlen(header), 0);
+                send(sock, internalError500, strlen(internalError500), 0);
+                total_bytes_read = 0;
+                memset(buffer, 0, BUFFER_MAX);
+            }
         } else if (strstr(buffer, "\r\n\r\n")) {
-            //todo: get first request
+            //get first request
 //            buffer[total_bytes_read] = '\0';
             handle_request(buffer, bytes_read, sock);
             total_bytes_read = 0;
-        } else {
-            //todo: save what we have so far, wait for more
-            strcpy(newRequest, buffer);
+            memset(buffer, 0, BUFFER_MAX);
+            continue;
         }
+        return;
     }
 }
 
-void checkOS(){
+void checkOS() {
     struct utsname unameData;
     uname(&unameData);
     printf("OS: %s\n", unameData.sysname);
@@ -239,8 +298,9 @@ void checkOS(){
         isOnMac = 1;
     }
 }
+
 //handle single request
-void handle_request(char *request, size_t request_len, int sock) {
+void handle_request(char *request, ssize_t request_len, int sock) {
     //parse request
     verbosePrintf("REQUEST: \n");
     verbosePrintf(request);
@@ -268,7 +328,8 @@ void handle_request(char *request, size_t request_len, int sock) {
             //found file
             //Check file permissions
             FILE *fp;
-            if ((fp = fopen(location, "r")) == NULL) {
+            fp = fopen(location, "r");
+            if (fp == NULL) {
                 printf("Error opening file\n");
             }
             if ((sb.st_mode & S_IRUSR) <= 0) {

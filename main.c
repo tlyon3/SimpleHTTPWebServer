@@ -11,6 +11,9 @@
 #include <sys/utsname.h>
 #include <semaphore.h>
 #include <pthread.h>
+
+#include <fcntl.h>
+#include <sys/types.h>
 #include <sys/epoll.h>
 
 #include "create_server_socket.h"
@@ -21,9 +24,17 @@
 #define DEFAULT_CONFIG "http.conf"
 #define THREAD_COUNT_DEFAULT 8
 #define MAX_QUEUE_SIZE_DEFAULT 10
-#define MAX_EVENTS 10
+#define MAX_EVENTS 100
 
-void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
+typedef struct client {
+    int fd; /* socket descriptor for connection */
+    socklen_t addr_len;
+    struct sockaddr_storage storage;
+    /*... many other members omitted for brevity */
+    /* you can, and probably will, add to this */
+} client_t;
+
+void serve_client(int sock, struct client* client_info, int epoll_fd);
 
 void handle_request(char *request, ssize_t request_len, int sock);
 
@@ -33,7 +44,7 @@ int isGet(char *);
 
 int isHead(char *);
 
-void consume();
+void consume(void *args);
 
 void checkOS();
 
@@ -48,7 +59,7 @@ char *notImplemented500 = "<html>\n<head>\n<title>501 Not Implemented</title>\n<
 char *forbidden403 = "<html>\n<head>\n<title>403 Forbidden</title>\n<body>\n\n<H2>403: File is forbidden</H2>\n\n</body></html>";
 char *internalError500 = "<html>\n<head>\n<title>500 Internal Server Error</title>\n<body>\n\n<H2>500: There was an error while serving the client</H2>\n\n</body></html>";
 
-pthread_t *threadPool;
+struct thread_info *threadPool;
 pthread_mutex_t mutex;
 //todo: rename
 sem_t openQueueSpot;
@@ -56,6 +67,57 @@ sem_t clientsInQueue;
 struct queue queue1;
 int thread_count = THREAD_COUNT_DEFAULT;
 int epollfd;
+struct server {
+    int fd;
+};
+
+struct thread_info {
+    pthread_t *thread;
+    int epoll_fd;
+};
+
+int set_blocking(int sock, int blocking) {
+    int flags;
+    /* Get flags for socket */
+    if ((flags = fcntl(sock, F_GETFL)) == -1) {
+        perror("fcntl get");
+        exit(EXIT_FAILURE);
+    }
+    /* Only change flags if they're not what we want */
+    if (blocking && (flags & O_NONBLOCK)) {
+        if (fcntl(sock, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+            perror("fcntl set block");
+            exit(EXIT_FAILURE);
+        }
+        return 0;
+    }
+    /* Only change flags if they're not what we want */
+    if (!blocking && !(flags & O_NONBLOCK)) {
+        if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+            perror("fcntl set nonblock");
+            exit(EXIT_FAILURE);
+        }
+        return 0;
+    }
+    return 0;
+}
+
+struct client *get_new_client(int sock) {
+    struct sockaddr_storage addr;
+    socklen_t add_len = sizeof(struct sockaddr_storage);
+    int new_fd = accept(sock, (struct sockaddr *) &addr, &add_len);
+    if (new_fd == -1) {
+        perror("accept");
+        return NULL;
+    }
+    set_blocking(new_fd, 0);
+    struct client *client = (struct client *) calloc(1, sizeof(struct client));
+    client->fd = new_fd;
+    client->storage = addr;
+    client->addr_len = add_len;
+    if (verbose) printf("got connection\n");
+    return client;
+}
 
 void prepend(char *s, const char *t) {
     size_t len = strlen(t);
@@ -68,33 +130,27 @@ void prepend(char *s, const char *t) {
     }
 }
 
-//void handle_sigchld(int sig) {
-//    int saved_errno = errno;
-//    while (waitpid((pid_t) (-1), 0, WNOHANG) > 0) {}
-//    errno = saved_errno;
-//}
-
 void clean_up_memory() {
     if (verbose) printf("Cleaning up memory\n");
     struct node *toFree = NULL;
     //free the queue
-    while ((toFree = dequeue(&queue1)) != NULL){
+    while ((toFree = dequeue(&queue1)) != NULL) {
         close(toFree->clientFD);
     }
     deconstructQueue(&queue1);
-    if (verbose) printf("Freeing thread pool: count = %d\n",thread_count);
+    if (verbose) printf("Freeing thread pool: count = %d\n", thread_count);
     for (int i = 0; i < thread_count; i++) {
-        pthread_kill(threadPool[i], SIGINT);
+        pthread_kill(threadPool[i].thread, SIGINT);
     }
     for (int i = 0; i < thread_count; i++) {
-        pthread_join(threadPool[i], NULL);
+        pthread_join(threadPool[i].thread, NULL);
     }
     free(threadPool);
     exit(0);
 }
 
 void sig_int(int sig) {
-    if(verbose) printf("Received signal: %d\n", sig);
+    if (verbose) printf("Received signal: %d\n", sig);
     cont = 0;
 }
 
@@ -168,9 +224,17 @@ int main(int argc, char *argv[]) {
     sem_init(&openQueueSpot, 0, max_queue_size);
     sem_init(&clientsInQueue, 0, 0);
     threadPool = malloc(thread_count * sizeof(pthread_t));
-    //todo: keep track of thread_params to free them later
     for (int i = 0; i < thread_count; i++) {
-        pthread_create(&threadPool[i], NULL, (void *)consume, NULL);
+        threadPool[i].epoll_fd = epoll_create1(0);
+        if (threadPool[i].epoll_fd == -1) {
+            perror("epoll_create1");
+            exit(EXIT_FAILURE);
+        } else {
+            threadPool[i].thread = (pthread_t *) malloc(sizeof(pthread_t));
+            if ((pthread_create(threadPool[i].thread, NULL, consume, (void *) &threadPool[i])) == 0) {
+                perror("pthread_create");
+            }
+        }
     }
 
     //different behavior based on operating system
@@ -180,72 +244,67 @@ int main(int argc, char *argv[]) {
     printf("Running on port: %s\n", port);
 
     int sock = create_server_socket(port, SOCK_STREAM);
-    if(verbose) printf("Created socket: %d\n", sock);
-    //todo: set blocking
+    if (verbose) printf("Created socket: %d\n", sock);
     cont = 1;
 
-    if((epollfd = epoll_create1(0)) == -1){
-      verbosePrintf("Error creating epoll\n");
+    epollfd = epoll_create1(0);
+    if (epollfd == -1) {
+        perror("epoll_create");
     }
-    struct epoll_event e, events[MAX_EVENTS];
-    e.events = EPOLLIN;
-    e.data.fd = sock;
-    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sock, &e) == -1){
-      verbosePrintf("Error in epoll_ctl\n");
 
+    set_blocking(sock, 0);
+
+    int nfds;
+    struct epoll_event ev;
+    struct epoll_event events[MAX_EVENTS];
+
+    ev.events = EPOLLIN;
+    struct server server = {.fd = sock};
+    ev.data.ptr = (void *) &server;
+
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, sock, &ev) == -1) {
+        perror("epoll_ctl");
+        exit(EXIT_FAILURE);
     }
+
+    int currentThread = 0;
     //producer
     while (cont) {
-        // struct sockaddr_storage client_addr;
-        // socklen_t client_addr_len = sizeof(client_addr);
-        // int clientFD = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
-        // if (clientFD == -1) {
-        //     if(errno == EINTR){
-        //         if(cont == 0){
-        //             if(verbose) printf("Exiting from producer\n");
-        //             break;
-        //         }
-        //     }
-        //     printf("ERROR: error in accept\n");
-        // } else {
-        //     //add client to queue
-        //     verbosePrintf("New client\n");
-        //     if(sem_wait(&openQueueSpot) == -1){
-        //         if(errno == EINTR){
-        //             if(cont == 0){
-        //                 break;
-        //             }
-        //         }
-        //     }
-        //     pthread_mutex_lock(&mutex);
-        //     enqueue(&queue1, clientFD, client_addr, client_addr_len);
-        //     pthread_mutex_unlock(&mutex);
-        //     sem_post(&clientsInQueue);
-        //     continue;
-        // }
-        // return 0;
-
+       nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+        if(nfds == -1){
+            perror("epoll_wait");
+            exit(EXIT_FAILURE);
+        }
         struct sockaddr_storage client_addr;
-        socklen_t = client_addr_len = sizeof(client_addr);
-        int clientFD = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
-        if(clientFD == -1){
-          if(errno = EINTR){
-            if(verbose) printf("Exiting from main thread\n");
-            break;
-          }
-          if(verbose) printf("ERROR: accept\n");
-          continue;
-        } else {
+        socklen_t addr_len = sizeof(client_addr);
+        int client_sock = accept(sock, (struct sockaddr*) &client_addr, &addr_len);
+        if(client_sock == -1){
+            if(errno == EINTR){
+                if(cont == 0){
+                    break;
+                }
+            }
+            perror("accept");
+            continue;
+        }
+        set_blocking(client_sock, 0);
+        int thread_id = currentThread;
+        currentThread++;
+        if(currentThread >= thread_count){
+            currentThread = 0;
+        }
+        ev.events = EPOLLIN;
+        ev.data.fd = client_sock;
 
-          for(int i=0; i < nfds; i++){
-            client_t* c = (client_t*)events[i].data.ptr;
-            if(events[i].events & EPOLLOUT){
-              //client->fd is ready for writing
-            }
-            if(events[i].events & EPOLLIN){
-              //client->fd is ready for reading
-            }
-          }
+        struct client* client_info1 = malloc(sizeof(struct client));
+        client_info1->fd = client_sock;
+        client_info1->storage = client_addr;
+        client_info1->addr_len = addr_len;
+        ev.data.ptr = (void*) client_info1;
+
+        if(epoll_ctl(threadPool[thread_id].epoll_fd, EPOLL_CTL_ADD, client_sock, &ev) == -1){
+            perror("epoll_ctl");
+            exit(EXIT_FAILURE);
         }
     }
     verbosePrintf("Shutting down server\n");
@@ -253,41 +312,32 @@ int main(int argc, char *argv[]) {
 }
 
 //consumer
-void consume() {
+void consume(void *args) {
+    int epoll_fd = -1;
+    struct epoll_event events[MAX_EVENTS];
+    int nfds = -1;
+    struct thread_info *thread = (struct thread_info *) args;
     while (cont) {
-//        if (sem_wait(&clientsInQueue) == -1) {
-//            if(errno == EINTR){
-//                if(cont == 0){
-//                    if(verbose) printf("Exiting from consume\n");
-//                    break;
-//                }
-//            }
-//        } else {
-//            pthread_mutex_lock(&mutex);
-//            struct node *client = dequeue(&queue1);
-//            int sock = client->clientFD;
-//            struct sockaddr_storage caddr = client->client_addr;
-//            socklen_t len = client->addr_len;
-//            free(client);
-//            pthread_mutex_unlock(&mutex);
-//            sem_post(&openQueueSpot);
-//            serve_client(sock, caddr, len);
-//            continue;
-//        }
-
+        nfds = epoll_wait(thread->epoll_fd, events, MAX_EVENTS, -1);
+        for (int i = 0; i < nfds; i++) {
+            struct client* client_info = (struct client*)events[i].data.ptr;
+            serve_client(client_info->fd, (struct client*)events[i].data.ptr, thread->epoll_fd);
+        }
     }
 }
 
-void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_len) {
+void serve_client(int sock, struct client* client_info, int epoll_fd) {
     char buffer[BUFFER_MAX];
     char client_hostname[NI_MAXHOST];
     char client_port[NI_MAXSERV];
+    struct sockaddr_storage client_addr = client_info->storage;
+    socklen_t addr_len = client_info->addr_len;
     int ret = getnameinfo((struct sockaddr *) &client_addr, addr_len, client_hostname, NI_MAXHOST, client_port,
                           NI_MAXSERV, 0);
     if (ret != 0) {
         printf("ERROR: error getting name info\n");
     }
-   if(verbose) printf("Connected to: %s:%s\n", client_hostname, client_port);
+    if (verbose) printf("Connected to: %s:%s\n", client_hostname, client_port);
     //serve client
     ssize_t bytes_read = 0;
     ssize_t total_bytes_read = 0;
@@ -295,7 +345,7 @@ void serve_client(int sock, struct sockaddr_storage client_addr, socklen_t addr_
         bytes_read = recv(sock, buffer + total_bytes_read, BUFFER_MAX, 0);
         total_bytes_read += bytes_read;
         if (bytes_read == 0) {
-            if(verbose) printf("Disconnected from %s:%s\n", client_hostname, client_port);
+            if (verbose) printf("Disconnected from %s:%s\n", client_hostname, client_port);
             close(sock);
             return;
         } else if (bytes_read < 0) {
@@ -476,8 +526,8 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                     printf("Error sending file: %s\n", strerror(errno));
                 }
             }
-            if(verbose) printf("Closing file pointer\n");
-            if(fclose(fp) == -1){
+            if (verbose) printf("Closing file pointer\n");
+            if (fclose(fp) == -1) {
                 printf("Error closing file: %s\n", strerror(errno));
             }
             //todo: there is a memory leak somewhere in here ^^

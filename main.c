@@ -11,6 +11,8 @@
 #include <sys/utsname.h>
 #include <semaphore.h>
 #include <pthread.h>
+#include <sys/epoll.h>
+
 #include "create_server_socket.h"
 #include "queue.h"
 
@@ -19,6 +21,7 @@
 #define DEFAULT_CONFIG "http.conf"
 #define THREAD_COUNT_DEFAULT 8
 #define MAX_QUEUE_SIZE_DEFAULT 10
+#define MAX_EVENTS 10
 
 void serve_client(int client, struct sockaddr_storage client_addr, socklen_t addr_len);
 
@@ -52,6 +55,7 @@ sem_t openQueueSpot;
 sem_t clientsInQueue;
 struct queue queue1;
 int thread_count = THREAD_COUNT_DEFAULT;
+int epollfd;
 
 void prepend(char *s, const char *t) {
     size_t len = strlen(t);
@@ -177,37 +181,72 @@ int main(int argc, char *argv[]) {
 
     int sock = create_server_socket(port, SOCK_STREAM);
     if(verbose) printf("Created socket: %d\n", sock);
+    //todo: set blocking
     cont = 1;
+
+    if((epollfd = epoll_create1(0)) == -1){
+      verbosePrintf("Error creating epoll\n");
+    }
+    struct epoll_event e, events[MAX_EVENTS];
+    e.events = EPOLLIN;
+    e.data.fd = sock;
+    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sock, &e) == -1){
+      verbosePrintf("Error in epoll_ctl\n");
+
+    }
     //producer
     while (cont) {
+        // struct sockaddr_storage client_addr;
+        // socklen_t client_addr_len = sizeof(client_addr);
+        // int clientFD = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
+        // if (clientFD == -1) {
+        //     if(errno == EINTR){
+        //         if(cont == 0){
+        //             if(verbose) printf("Exiting from producer\n");
+        //             break;
+        //         }
+        //     }
+        //     printf("ERROR: error in accept\n");
+        // } else {
+        //     //add client to queue
+        //     verbosePrintf("New client\n");
+        //     if(sem_wait(&openQueueSpot) == -1){
+        //         if(errno == EINTR){
+        //             if(cont == 0){
+        //                 break;
+        //             }
+        //         }
+        //     }
+        //     pthread_mutex_lock(&mutex);
+        //     enqueue(&queue1, clientFD, client_addr, client_addr_len);
+        //     pthread_mutex_unlock(&mutex);
+        //     sem_post(&clientsInQueue);
+        //     continue;
+        // }
+        // return 0;
+
         struct sockaddr_storage client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
+        socklen_t = client_addr_len = sizeof(client_addr);
         int clientFD = accept(sock, (struct sockaddr *) &client_addr, &client_addr_len);
-        if (clientFD == -1) {
-            if(errno == EINTR){
-                if(cont == 0){
-                    if(verbose) printf("Exiting from producer\n");
-                    break;
-                }
-            }
-            printf("ERROR: error in accept\n");
+        if(clientFD == -1){
+          if(errno = EINTR){
+            if(verbose) printf("Exiting from main thread\n");
+            break;
+          }
+          if(verbose) printf("ERROR: accept\n");
+          continue;
         } else {
-            //add client to queue
-            verbosePrintf("New client\n");
-            if(sem_wait(&openQueueSpot) == -1){
-                if(errno == EINTR){
-                    if(cont == 0){
-                        break;
-                    }
-                }
+
+          for(int i=0; i < nfds; i++){
+            client_t* c = (client_t*)events[i].data.ptr;
+            if(events[i].events & EPOLLOUT){
+              //client->fd is ready for writing
             }
-            pthread_mutex_lock(&mutex);
-            enqueue(&queue1, clientFD, client_addr, client_addr_len);
-            pthread_mutex_unlock(&mutex);
-            sem_post(&clientsInQueue);
-            continue;
+            if(events[i].events & EPOLLIN){
+              //client->fd is ready for reading
+            }
+          }
         }
-        return 0;
     }
     verbosePrintf("Shutting down server\n");
     clean_up_memory();
@@ -216,25 +255,26 @@ int main(int argc, char *argv[]) {
 //consumer
 void consume() {
     while (cont) {
-        if (sem_wait(&clientsInQueue) == -1) {
-            if(errno == EINTR){
-                if(cont == 0){
-                    if(verbose) printf("Exiting from consume\n");
-                    break;
-                }
-            }
-        } else {
-            pthread_mutex_lock(&mutex);
-            struct node *client = dequeue(&queue1);
-            int sock = client->clientFD;
-            struct sockaddr_storage caddr = client->client_addr;
-            socklen_t len = client->addr_len;
-            free(client);
-            pthread_mutex_unlock(&mutex);
-            sem_post(&openQueueSpot);
-            serve_client(sock, caddr, len);
-            continue;
-        }
+//        if (sem_wait(&clientsInQueue) == -1) {
+//            if(errno == EINTR){
+//                if(cont == 0){
+//                    if(verbose) printf("Exiting from consume\n");
+//                    break;
+//                }
+//            }
+//        } else {
+//            pthread_mutex_lock(&mutex);
+//            struct node *client = dequeue(&queue1);
+//            int sock = client->clientFD;
+//            struct sockaddr_storage caddr = client->client_addr;
+//            socklen_t len = client->addr_len;
+//            free(client);
+//            pthread_mutex_unlock(&mutex);
+//            sem_post(&openQueueSpot);
+//            serve_client(sock, caddr, len);
+//            continue;
+//        }
+
     }
 }
 

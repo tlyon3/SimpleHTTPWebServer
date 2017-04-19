@@ -18,6 +18,7 @@
 
 #include "create_server_socket.h"
 #include "queue.h"
+#include "list.h"
 
 #define BUFFER_MAX 1024
 #define DEFAULT_PORT "8080"
@@ -26,17 +27,11 @@
 #define MAX_QUEUE_SIZE_DEFAULT 10
 #define MAX_EVENTS 100
 
-typedef struct client {
-    int fd; /* socket descriptor for connection */
-    socklen_t addr_len;
-    struct sockaddr_storage storage;
-    /*... many other members omitted for brevity */
-    /* you can, and probably will, add to this */
-} client_t;
+struct client *clients;
 
-void serve_client(int sock, struct client* client_info, int epoll_fd);
+void serve_client(int sock, struct client *client_info, int epoll_fd);
 
-void handle_request(char *request, ssize_t request_len, int sock);
+void handle_request(struct client *);
 
 int isPost(char *);
 
@@ -44,9 +39,19 @@ int isGet(char *);
 
 int isHead(char *);
 
+int isDelete(char *);
+
 void consume(void *args);
 
 void checkOS();
+
+int send_responses(struct client*);
+
+int recv_requests(struct client*);
+
+int send_data(struct client*);
+
+int recv_data(struct client*);
 
 int isOnMac;
 int cont = 1;
@@ -64,9 +69,12 @@ pthread_mutex_t mutex;
 //todo: rename
 sem_t openQueueSpot;
 sem_t clientsInQueue;
+
 struct queue queue1;
 int thread_count = THREAD_COUNT_DEFAULT;
 int epollfd;
+struct list list1;
+
 struct server {
     int fd;
 };
@@ -115,6 +123,7 @@ struct client *get_new_client(int sock) {
     client->fd = new_fd;
     client->storage = addr;
     client->addr_len = add_len;
+    client->timestamp = time(NULL);
     if (verbose) printf("got connection\n");
     return client;
 }
@@ -146,6 +155,7 @@ void clean_up_memory() {
         pthread_join(threadPool[i].thread, NULL);
     }
     free(threadPool);
+    printf("EXIT IN CLEAN UP MEMORY\n");
     exit(0);
 }
 
@@ -219,24 +229,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    //create thread pool
-    pthread_mutex_init(&mutex, NULL);
-    sem_init(&openQueueSpot, 0, max_queue_size);
-    sem_init(&clientsInQueue, 0, 0);
-    threadPool = malloc(thread_count * sizeof(pthread_t));
-    for (int i = 0; i < thread_count; i++) {
-        threadPool[i].epoll_fd = epoll_create1(0);
-        if (threadPool[i].epoll_fd == -1) {
-            perror("epoll_create1");
-            exit(EXIT_FAILURE);
-        } else {
-            threadPool[i].thread = (pthread_t *) malloc(sizeof(pthread_t));
-            if ((pthread_create(threadPool[i].thread, NULL, consume, (void *) &threadPool[i])) == 0) {
-                perror("pthread_create");
-            }
-        }
-    }
-
     //different behavior based on operating system
     checkOS();
 
@@ -266,127 +258,260 @@ int main(int argc, char *argv[]) {
         perror("epoll_ctl");
         exit(EXIT_FAILURE);
     }
+    list1 = newList();
 
-    int currentThread = 0;
-    //producer
     while (cont) {
-       nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
-        if(nfds == -1){
+        sweep(&list1);
+        nfds = epoll_wait(epollfd, events, MAX_EVENTS, 2500);
+        if (nfds == 0) {
+            continue;
+        }
+        if (nfds == -1) {
             perror("epoll_wait");
             exit(EXIT_FAILURE);
         }
-        struct sockaddr_storage client_addr;
-        socklen_t addr_len = sizeof(client_addr);
-        int client_sock = accept(sock, (struct sockaddr*) &client_addr, &addr_len);
-        if(client_sock == -1){
-            if(errno == EINTR){
-                if(cont == 0){
-                    break;
+        for (int i = 0; i < nfds; i++) {
+            struct client *client1 = (struct client *) events[i].data.ptr;
+            //new connection
+            if (client1 == &server) {
+                struct client *new_client = get_new_client(server.fd);
+                if (new_client == NULL) {
+                    continue;
+                }
+                add(&list1, new_client);
+                ev.events = EPOLLIN;
+                ev.data.ptr = (void *) new_client;
+                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, new_client->fd, &ev) == -1) {
+                    perror("epoll_ctl: new_client");
+                    exit(EXIT_FAILURE);
+                }
+                continue;
+            }
+            //event from client
+            if (events[i].events & EPOLLIN) {
+                if (recv_requests(client1) == 0) {
+                    ev.events = EPOLLOUT | EPOLLRDHUP | EPOLLET;
+                    ev.data.ptr = (void *) client1;
+                    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, client1->fd, &ev) == -1) {
+                        perror("epoll_ctl: switching to output events");
+                        exit(EXIT_FAILURE);
+                    }
                 }
             }
-            perror("accept");
-            continue;
-        }
-        set_blocking(client_sock, 0);
-        int thread_id = currentThread;
-        currentThread++;
-        if(currentThread >= thread_count){
-            currentThread = 0;
-        }
-        ev.events = EPOLLIN;
-        ev.data.fd = client_sock;
-
-        struct client* client_info1 = malloc(sizeof(struct client));
-        client_info1->fd = client_sock;
-        client_info1->storage = client_addr;
-        client_info1->addr_len = addr_len;
-        ev.data.ptr = (void*) client_info1;
-
-        if(epoll_ctl(threadPool[thread_id].epoll_fd, EPOLL_CTL_ADD, client_sock, &ev) == -1){
-            perror("epoll_ctl");
-            exit(EXIT_FAILURE);
+            if (events[i].events & EPOLLOUT) {
+                if (send_responses(client1) == 0) {
+                    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+                    ev.data.ptr = (void *) client1;
+                    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, client1->fd, &ev) == -1) {
+                        perror("epoll_ctl: switching to input events");
+                        exit(EXIT_FAILURE);
+                    }
+                }
+            }
+            if(events[i].events & EPOLLRDHUP) {
+                if(client1->state == RECEIVING){
+                    client1->state = DISCONNECTED;
+                }
+            }
+            if(client1->state == DISCONNECTED){
+                removeFD(&list1, client1->fd);
+            }
         }
     }
     verbosePrintf("Shutting down server\n");
     clean_up_memory();
+    printf("Cleaned memory...Exiting\n");
+}
+
+int recv_requests(struct client *c) {
+    if (recv_data(c) != 0) {
+        c->state = DISCONNECTED;
+        return 0;
+    }
+    c->timestamp = time(NULL);
+    c->state = SENDING;
+    handle_request(c);
+    return 0;
+}
+
+int send_responses(struct client *c) {
+    if (send_data(c) == 1) {
+        return 1;
+    }
+    c->send_buf.length = 0;
+    c->send_buf.position = 0;
+    c->state = RECEIVING;
+    c->recv_buf.length = 0;
+    c->recv_buf.position = 0;
+    return 0;
+}
+
+int send_data(struct client *c) {
+    char *buffer = (char *) c->send_buf.data;
+    int bytes_sent;
+    int bytes_left = c->send_buf.length - c->send_buf.position;
+    while (bytes_left > 0) {
+        bytes_sent = send(c->fd, &buffer[c->send_buf.position], bytes_left, 0);
+        if (bytes_sent == -1) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                if(verbose)printf("Didn't finish!\n");
+                return 1;
+            } else if (errno == EINTR) {
+                if(verbose)printf("EINTR\n");
+                continue;
+            } else if (errno == EPIPE || errno == ECONNRESET) {
+                if(verbose)printf("DISCONNECTED\n");
+                c->state = DISCONNECTED;
+                return 1;
+            } else {
+                perror("send");
+                c->state = DISCONNECTED;
+                return 1;
+            }
+        }
+        bytes_left -= bytes_sent;
+        c->send_buf.position += bytes_sent;
+    }
+    return 0;
+}
+
+int recv_data(struct client *c) {
+    char temp_buffer[BUFFER_MAX];
+    int bytes_read;
+    while (1) {
+        bytes_read = recv(c->fd, temp_buffer, BUFFER_MAX, 0);
+        if (bytes_read == -1) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                break;
+            } else if (errno = EINTR) {
+                continue;
+            } else {
+                perror("recv");
+                return 1;
+            }
+        } else if (bytes_read == 0) {
+            break;
+        }
+        int new_length = c->recv_buf.length + bytes_read;
+        if (c->recv_buf.max_length < new_length) {
+            c->recv_buf.data = realloc(c->recv_buf.data, new_length * 2);
+            c->recv_buf.max_length = new_length * 2;
+        }
+        memcpy(&(c->recv_buf.data)[c->recv_buf.length], temp_buffer, bytes_read);
+        c->recv_buf.length += bytes_read;
+    }
+    return 0;
 }
 
 //consumer
-void consume(void *args) {
-    int epoll_fd = -1;
-    struct epoll_event events[MAX_EVENTS];
-    int nfds = -1;
-    struct thread_info *thread = (struct thread_info *) args;
-    while (cont) {
-        nfds = epoll_wait(thread->epoll_fd, events, MAX_EVENTS, -1);
-        for (int i = 0; i < nfds; i++) {
-            struct client* client_info = (struct client*)events[i].data.ptr;
-            serve_client(client_info->fd, (struct client*)events[i].data.ptr, thread->epoll_fd);
-        }
-    }
-}
+//void consume(void *t) {
+//    int epoll_fd = -1;
+//    struct epoll_event events[MAX_EVENTS];
+//    int nfds = -1;
+//    struct thread_info *thread = (struct thread_info *) t;
+//    while (cont) {
+//        nfds = epoll_wait(thread->epoll_fd, events, MAX_EVENTS, -1);
+//        for (int i = 0; i < nfds; i++) {
+//            if (events[i].events & EPOLLIN) {
+//                struct client *client_info = (struct client *) events[i].data.ptr;
+//                client_info->timestamp = time(NULL);
+//                serve_client(client_info->fd, (struct client *) events[i].data.ptr, thread->epoll_fd);
+//            }
+//        }
+//    }
+//}
 
-void serve_client(int sock, struct client* client_info, int epoll_fd) {
-    char buffer[BUFFER_MAX];
-    char client_hostname[NI_MAXHOST];
-    char client_port[NI_MAXSERV];
-    struct sockaddr_storage client_addr = client_info->storage;
-    socklen_t addr_len = client_info->addr_len;
-    int ret = getnameinfo((struct sockaddr *) &client_addr, addr_len, client_hostname, NI_MAXHOST, client_port,
-                          NI_MAXSERV, 0);
-    if (ret != 0) {
-        printf("ERROR: error getting name info\n");
-    }
-    if (verbose) printf("Connected to: %s:%s\n", client_hostname, client_port);
-    //serve client
-    ssize_t bytes_read = 0;
-    ssize_t total_bytes_read = 0;
-    while (cont) {
-        bytes_read = recv(sock, buffer + total_bytes_read, BUFFER_MAX, 0);
-        total_bytes_read += bytes_read;
-        if (bytes_read == 0) {
-            if (verbose) printf("Disconnected from %s:%s\n", client_hostname, client_port);
-            close(sock);
-            return;
-        } else if (bytes_read < 0) {
-            //error in recv
-            if (errno == EINTR) {
-                if (cont == 0) {
-                    if (verbose) printf("Exiting serve_client\n");
-                    break;
-                }
-            } else if (errno == EPIPE) {
-                if (verbose) printf("ERROR: error in receiving\n");
-                char currentTime[80];
-                struct tm *currentTimeInfo;
-                time_t rawTime = 0;
-                currentTimeInfo = localtime(&rawTime);
-                strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
-                char header[BUFFER_MAX];
-                sprintf(header,
-                        "HTTP/1.1 500 Internal Server Error\r\n"
-                                "Server: CS360 Server\r\n"
-                                "Date: %s\r\n"
-                                "Content-Type: text/html\r\n"
-                                "Content-Length: %lu\r\n\r\n", currentTime, strlen(internalError500));
-                send(sock, header, strlen(header), 0);
-                send(sock, internalError500, strlen(internalError500), 0);
-                total_bytes_read = 0;
-                memset(buffer, 0, BUFFER_MAX);
-            }
-        } else if (strstr(buffer, "\r\n\r\n")) {
-            //get first request
-//            buffer[total_bytes_read] = '\0';
-            handle_request(buffer, bytes_read, sock);
-            total_bytes_read = 0;
-            memset(buffer, 0, BUFFER_MAX);
-            continue;
-        }
-        close(sock);
-        return;
-    }
-    close(sock);
-}
+//void serve_client(int sock, struct client *client_info, int epoll_fd) {
+//    char buffer[BUFFER_MAX];
+//    char client_hostname[NI_MAXHOST];
+//    char client_port[NI_MAXSERV];
+//    struct sockaddr_storage client_addr = client_info->storage;
+//    socklen_t addr_len = client_info->addr_len;
+//    int ret = getnameinfo((struct sockaddr *) &client_addr, addr_len, client_hostname, NI_MAXHOST, client_port,
+//                          NI_MAXSERV, 0);
+//    if (ret != 0) {
+//        printf("ERROR: error getting name info\n");
+//    }
+//    if (verbose) printf("Connected to: %s:%s\n", client_hostname, client_port);
+//    //serve client
+//    ssize_t bytes_read = 0;
+//    ssize_t total_bytes_read = 0;
+//    while (cont) {
+//        bytes_read = recv(sock, buffer, BUFFER_MAX, 0);
+////        if(sem_wait(&clientsInQueue) == -1){
+////            if(errno == EINTR){
+////                if(cont == 0){
+////                    break;
+////                }
+////            }
+////        }
+////        pthread_mutex_lock(&mutex);
+//
+//        client_info->timestamp = time(NULL);
+////
+////        pthread_mutex_unlock(&mutex);
+////        sem_post(&openQueueSpot);
+//
+//        total_bytes_read += bytes_read;
+//        if (bytes_read == 0) {
+//            if (verbose) printf("Disconnected from %s:%s\n", client_hostname, client_port);
+//
+////            if(sem_wait(&clientsInQueue) == -1){
+////                if(errno == EINTR){
+////                    if(cont == 0){
+////                        break;
+////                    }
+////                }
+////            }
+////            pthread_mutex_lock(&mutex);
+//
+//            removeFD(&list1, sock);
+//
+////            pthread_mutex_unlock(&mutex);
+////            sem_post(&openQueueSpot);
+//
+//            return;
+//        } else if (bytes_read < 0) {
+//            //error in recv
+//            if (errno == EINTR) {
+//                if (cont == 0) {
+//                    if (verbose) printf("Exiting serve_client\n");
+//                    break;
+//                }
+//            } else if (errno == EPIPE) {
+//                if (verbose) printf("ERROR: error in receiving\n");
+//                char currentTime[80];
+//                struct tm *currentTimeInfo;
+//                time_t rawTime = 0;
+//                currentTimeInfo = localtime(&rawTime);
+//                strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
+//                char header[BUFFER_MAX];
+//                sprintf(header,
+//                        "HTTP/1.1 500 Internal Server Error\r\n"
+//                                "Server: CS360 Server\r\n"
+//                                "Date: %s\r\n"
+//                                "Content-Type: text/html\r\n"
+//                                "Content-Length: %lu\r\n\r\n", currentTime, strlen(internalError500));
+//                send(sock, header, strlen(header), 0);
+//                send(sock, internalError500, strlen(internalError500), 0);
+//                total_bytes_read = 0;
+//                memset(buffer, 0, BUFFER_MAX);
+//            }
+//            continue;
+//        } else if (strstr(buffer, "\r\n\r\n")) {
+//            //get first request
+////            buffer[total_bytes_read] = '\0';
+//            handle_request(buffer, bytes_read, sock);
+//            total_bytes_read = 0;
+//            memset(buffer, 0, BUFFER_MAX);
+//            continue;
+//        }
+//        if (verbose) printf("Closing socket: %d\n", sock);
+//        removeFD(&list1, sock);
+//        return;
+//    }
+//    removeFD(&list1, sock);
+//}
 
 void checkOS() {
     struct utsname unameData;
@@ -399,7 +524,11 @@ void checkOS() {
 }
 
 //handle single request
-void handle_request(char *request, ssize_t request_len, int sock) {
+void handle_request(struct client *c) {
+    if(c->recv_buf.length <= 0){
+        return;
+    }
+    char *request = c->recv_buf.data;
     //parse request
     verbosePrintf("REQUEST: \n");
     verbosePrintf(request);
@@ -447,11 +576,23 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                                 "Date: %s\r\n"
                                 "Content-Type: text/html\r\n"
                                 "Content-Length: %lu\r\n\r\n", currentTime, strlen(forbidden403));
-                send(sock, header, strlen(header), 0);
-                send(sock, forbidden403, strlen(forbidden403), 0);
+
+                int response_length = strlen(header) + strlen(forbidden403);
+                if (c->send_buf.max_length < response_length) {
+                    c->send_buf.data = realloc(c->send_buf.data, response_length);
+                    c->send_buf.max_length = response_length;
+                }
+                c->send_buf.length = response_length;
+                c->send_buf.position = 0;
+
+                //send(sock, header, strlen(header), 0);
+                memcpy(c->send_buf.data, header, strlen(header));
+                //send(sock, forbidden403, strlen(forbidden403), 0);
+                printf("forbidden copying\n");
+                memcpy(&c->send_buf.data[strlen(header)], forbidden403, strlen(forbidden403));
+
                 return;
             }
-            //todo: there is a memory leak somewhere in here vv
             //get MIME file type
             char contentType[16] = "n";
             int beginCopying = 0;
@@ -513,24 +654,38 @@ void handle_request(char *request, ssize_t request_len, int sock) {
             verbosePrintf("RESPONSE HEADER: \n");
             verbosePrintf(header);
 
-            //send header
-            send(sock, header, strlen(header), 0);
-            //macOS. Works!
-            if (isOnMac) {
-                if (sendfile(fileno(fp), sock, 0, &size, NULL, 0) == -1) {
-                    printf("Error sending file: %s\n", strerror(errno));
-                }
-            } else {
-                //linux. Works!
-                if (sendfile(sock, fileno(fp), 0, &size, NULL, 0) == -1) {
-                    printf("Error sending file: %s\n", strerror(errno));
-                }
+            int response_length = strlen(header) + size;
+
+            if (c->send_buf.max_length < response_length) {
+                c->send_buf.data = realloc(c->send_buf.data, response_length);
+                c->send_buf.max_length = response_length;
             }
+            c->send_buf.length = response_length;
+            c->send_buf.position = 0;
+            //send header
+            //send(sock, header, strlen(header), 0);
+            memcpy(c->send_buf.data, header, strlen(header));
+            char* body;
+            body = (char*)malloc(size * sizeof(char));
+            fread(body, size, 1, fp);
+            memcpy(&c->send_buf.data[strlen(header)], body, size);
+            free(body);
+            //macOS. Works!
+//            if (isOnMac) {
+//                if (sendfile(fileno(fp), sock, 0, &size, NULL, 0) == -1) {
+//                    printf("Error sending file: %s\n", strerror(errno));
+//                }
+//            } else {
+//                //linux. Works!
+//                if (sendfile(sock, fileno(fp), 0, &size, NULL, 0) == -1) {
+//                    printf("Error sending file: %s\n", strerror(errno));
+//                }
+//            }
+
             if (verbose) printf("Closing file pointer\n");
             if (fclose(fp) == -1) {
                 printf("Error closing file: %s\n", strerror(errno));
             }
-            //todo: there is a memory leak somewhere in here ^^
             return;
         } else {
             char currentTime[80];
@@ -547,9 +702,20 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                     "Content-Type: text/html\r\n"
                     "Server: CS360-Server\r\n\r\n", currentTime, strlen(notFound404));
             verbosePrintf(header);
-            send(sock, header, strlen(header), 0);
-            //send back html for 404
-            send(sock, notFound404, strlen(notFound404), 0);
+            int response_length = strlen(header) + strlen(notFound404);
+
+            if (c->send_buf.max_length < response_length) {
+                c->send_buf.data = realloc(c->send_buf.data, response_length);
+                c->send_buf.max_length = response_length;
+            }
+            c->send_buf.length = response_length;
+            c->send_buf.position = 0;
+
+            //send(sock, header, strlen(header), 0);
+            memcpy(c->send_buf.data, header, strlen(header));
+            //send(sock, forbidden403, strlen(forbidden403), 0);
+            printf("not found copying\n");
+            memcpy(&c->send_buf.data[strlen(header)], notFound404, strlen(notFound404));
         }
 
     } else if (isPost(type)) {
@@ -567,9 +733,21 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                 "Content-Type: text/html\r\n"
                 "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
         verbosePrintf(header);
-        send(sock, header, strlen(header), 0);
-        //send back html for 404
-        send(sock, notImplemented500, strlen(notImplemented500), 0);
+        int response_length = strlen(header) + strlen(notImplemented500);
+
+        if (c->send_buf.max_length < response_length) {
+            c->send_buf.data = realloc(c->send_buf.data, response_length);
+            c->send_buf.max_length = response_length;
+        }
+        c->send_buf.length = response_length;
+        c->send_buf.position = 0;
+
+        //send(sock, header, strlen(header), 0);
+        memcpy(c->send_buf.data, header, strlen(header));
+        //send(sock, forbidden403, strlen(forbidden403), 0);
+        printf("not implemented copying\n");
+        memcpy(&c->send_buf.data[strlen(header)], notImplemented500, strlen(notImplemented500));
+
         return;
     } else if (isHead(type)) {
         char currentTime[80];
@@ -586,9 +764,51 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                 "Content-Type: text/html\r\n"
                 "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
         verbosePrintf(header);
-        send(sock, header, strlen(header), 0);
-        //send back html for 404
-        send(sock, notImplemented500, strlen(notImplemented500), 0);
+        int response_length = strlen(header) + strlen(notImplemented500);
+
+        if (c->send_buf.max_length < response_length) {
+            c->send_buf.data = realloc(c->send_buf.data, response_length);
+            c->send_buf.max_length = response_length;
+        }
+        c->send_buf.length = response_length;
+        c->send_buf.position = 0;
+
+        //send(sock, header, strlen(header), 0);
+        memcpy(c->send_buf.data, header, strlen(header));
+        //send(sock, forbidden403, strlen(forbidden403), 0);
+        printf("not implemented copying\n");
+        memcpy(&c->send_buf.data[strlen(header)], notImplemented500, strlen(notImplemented500));
+
+    } else if (isDelete(type)) {
+        char currentTime[80];
+        struct tm *currentTimeInfo;
+        time_t rawTime = 0;
+        currentTimeInfo = localtime(&rawTime);
+        strftime(currentTime, 80, "%a, %d %b %Y %H:%M:%S %Z", currentTimeInfo);
+        //only need to send the header back
+        //send back error code 501
+        char header[1024];
+        sprintf(header, "HTTP/1.1 501 Not Implemented\r\n"
+                "Date: %s\r\n"
+                "Content-Length: %lu\r\n"
+                "Content-Type: text/html\r\n"
+                "Server: CS360-Server\r\n\r\n", currentTime, strlen(notImplemented500));
+        verbosePrintf(header);
+        int response_length = strlen(header) + strlen(notImplemented500);
+
+        if (c->send_buf.max_length < response_length) {
+            c->send_buf.data = realloc(c->send_buf.data, response_length);
+            c->send_buf.max_length = response_length;
+        }
+        c->send_buf.length = response_length;
+        c->send_buf.position = 0;
+
+        //send(sock, header, strlen(header), 0);
+        memcpy(c->send_buf.data, header, strlen(header));
+        //send(sock, forbidden403, strlen(forbidden403), 0);
+        printf("not implemented copying\n");
+
+        memcpy(&c->send_buf.data[strlen(header)], notImplemented500, strlen(notImplemented500));
     } else {
         char currentTime[80];
         struct tm *currentTimeInfo;
@@ -602,11 +822,22 @@ void handle_request(char *request, ssize_t request_len, int sock) {
                 "Content-Length: %lu\r\n"
                 "Server: CS360-Server\r\n\r\n", currentTime, strlen(badRequest400));
         verbosePrintf(header);
-        send(sock, header, strlen(header), 0);
-        //send back html for 404
-        send(sock, badRequest400, strlen(badRequest400), 0);
-        close(sock);
-        exit(400);
+        int response_length = strlen(header) + strlen(badRequest400);
+
+        if (c->send_buf.max_length < response_length) {
+            c->send_buf.data = realloc(c->send_buf.data, response_length);
+            c->send_buf.max_length = response_length;
+        }
+        c->send_buf.length = response_length;
+        c->send_buf.position = 0;
+
+        //send(sock, header, strlen(header), 0);
+        memcpy(c->send_buf.data, header, strlen(header));
+        //send(sock, forbidden403, strlen(forbidden403), 0);
+        printf("bad request copying\n");
+        memcpy(&c->send_buf.data[strlen(header)], badRequest400, strlen(badRequest400));
+        removeFD(&list1, c->fd);
+        printf("EXIT IN 400\n");
     }
 }
 
@@ -620,4 +851,12 @@ int isHead(char *request) {
 
 int isGet(char *request) {
     return request[0] == 'G' && request[1] == 'E' && request[2] == 'T';
+}
+
+int isDelete(char *request) {
+    if (strstr(request, "DELETE")) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
